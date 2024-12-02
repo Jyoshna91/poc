@@ -1,0 +1,127 @@
+import paramiko
+import pynetbox
+import re
+
+NETBOX_URL = 'http://192.168.0.81:8000'
+NETBOX_TOKEN = '6ffa745a94dfd233805958abb3e7d101c6fdeb76'
+virtual_device_ip = '192.168.0.198'
+device_name = 'netbox'
+virtual_device_username = 'tcs'
+virtual_device_password = 'tcs@123'
+
+nb = pynetbox.api(NETBOX_URL, token=NETBOX_TOKEN)
+
+def get_enp0s3_details():
+    ssh_client = paramiko.SSHClient()
+    ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    
+    try:
+        ssh_client.connect(virtual_device_ip, username=virtual_device_username, password=virtual_device_password)
+        
+        stdin, stdout, stderr = ssh_client.exec_command("ip address")
+        output = stdout.read().decode()
+
+        enp0s3_section = re.search(r"2: enp0s3.*?(?=^\d+:|\Z)", output, re.DOTALL | re.MULTILINE)
+        if not enp0s3_section:
+            print("Could not find enp0s3 interface in the output.")
+            return None, None, None
+
+        enp0s3_output = enp0s3_section.group(0)
+        ipv4_match = re.search(r"inet\s+(\d+\.\d+\.\d+\.\d+)", enp0s3_output)
+        ipv6_match = re.search(r"inet6\s+([a-fA-F0-9:]+)", enp0s3_output)
+        mac_match = re.search(r"ether\s+([0-9a-fA-F:]+)", enp0s3_output)
+
+        ipv4_address = ipv4_match.group(1) if ipv4_match else None
+        ipv6_address = ipv6_match.group(1) if ipv6_match else None
+        mac_address = mac_match.group(1) if mac_match else None
+
+        return ipv4_address, ipv6_address, mac_address
+
+    except Exception as e:
+        print(f"An error occurred while connecting to the virtual device: {e}")
+        return None, None, None
+    finally:
+        ssh_client.close()
+
+def get_or_create_ip(ip_address, device, interface_name="enp0s3"):
+    ip_obj = nb.ipam.ip_addresses.get(address=ip_address)
+    if not ip_obj:
+        ip_obj = nb.ipam.ip_addresses.create({
+            "address": ip_address,
+            #"status": "active",
+        })
+    
+    if not ip_obj.assigned_object:
+        
+        interface = nb.dcim.interfaces.get(device_id=device.id, name=interface_name)
+        if not interface:
+            interface = nb.dcim.interfaces.create({
+                "device": device.id,
+                "name": interface_name,
+                "type": "1000base-t"
+            })
+        
+        ip_obj.update({"assigned_object_type": "dcim.interface", "assigned_object_id": interface.id})
+
+    return ip_obj
+def update_netbox_device(mac_address, status):
+    """Update the device in NetBox with MAC address and status."""
+    device = nb.dcim.devices.get(name=device_name)
+    if device:
+        print(f"Updating device '{device_name}' in NetBox...")
+        update_data = {
+            "status": status,
+            "custom_fields": {
+                "MAC_Address": mac_address
+            }
+        }
+
+        device.update(update_data)
+        print(f"Device '{device_name}' updated in NetBox with:")
+        print(f" - MAC Address: {mac_address}")
+        print(f" - Status: {status}")
+    else:
+        print(f"Device '{device_name}' not found in NetBox.")
+
+def update_netbox_device_ips(ipv4_address, ipv6_address, mac_address):
+    """Update the device in NetBox with the primary IPv4, IPv6 addresses, and MAC address."""
+    device = nb.dcim.devices.get(name=device_name)
+    if device:
+        ipv4_obj = get_or_create_ip(ipv4_address, device) if ipv4_address else None
+        ipv6_obj = get_or_create_ip(ipv6_address, device) if ipv6_address else None
+
+        update_data = {}
+
+        if ipv4_obj:
+            update_data["primary_ip4"] = ipv4_obj.id
+        if ipv6_obj:
+            update_data["primary_ip6"] = ipv6_obj.id
+        
+        if mac_address:
+            interface = nb.dcim.interfaces.get(device_id=device.id, name="enp0s3")
+            if not interface:
+                interface = nb.dcim.interfaces.create({
+                    "device": device.id,
+                    "name": "enp0s3",
+                    "type": "1000base-t",
+                    "mac_address": mac_address
+                })
+            else:
+                interface.update({"mac_address": mac_address})
+
+        if update_data:
+            device.update(update_data)
+            print(f"Device '{device_name}' updated in NetBox with:")
+            print(f" - IPv4 Address: {ipv4_address}")
+            print(f" - IPv6 Address: {ipv6_address}")
+            print(f" - MAC Address: {mac_address}")
+        else:
+            print("No IP address or MAC address data to update.")
+    else:
+        print(f"Device '{device_name}' not found in NetBox.")
+
+ipv4_address, ipv6_address, mac_address = get_enp0s3_details()
+if ipv4_address or ipv6_address or mac_address:
+    update_netbox_device_ips(ipv4_address, ipv6_address, mac_address)
+else:
+    print("Failed to retrieve necessary IP or MAC information from the enp0s3 interface.")
